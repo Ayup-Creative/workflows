@@ -27,6 +27,8 @@ jobs:
     name: Quality
     needs: preflight
     uses: ./.github/workflows/tests.yml
+    secrets:
+      COMPOSER_TOKEN: ${{ secrets.COMPOSER_TOKEN }}
 
   release:
     name: Release Please

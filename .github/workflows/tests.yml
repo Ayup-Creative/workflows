@@ -18,6 +18,15 @@ name: Reusable PHP Tests
         required: false
         type: string
         default: ''
+      composer_repositories:
+        description: JSON object mapping Composer repository names to VCS URLs.
+        required: false
+        type: string
+        default: '{}'
+    secrets:
+      composer_token:
+        description: Optional GitHub token used to read private Composer repositories.
+        required: false
 
 permissions:
   contents: read
@@ -30,6 +39,7 @@ jobs:
       php_versions: ${{ steps.versions.outputs.php_versions }}
       phpstan_php_version: ${{ steps.versions.outputs.phpstan_php_version }}
       lowest_php_version: ${{ steps.versions.outputs.lowest_php_version }}
+      composer_repositories: ${{ steps.composer.outputs.composer_repositories }}
     steps:
       - name: Validate PHP versions
         id: versions
@@ -87,6 +97,36 @@ jobs:
             echo "lowest_php_version=$resolved_lowest_version"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Validate Composer repositories
+        id: composer
+        shell: bash
+        env:
+          COMPOSER_REPOSITORIES: ${{ inputs.composer_repositories }}
+        run: |
+          set -euo pipefail
+
+          if ! normalized_repositories=$(jq -ce '
+            if type != "object" then
+              error("composer_repositories must be a JSON object")
+            elif any(to_entries[];
+              (.key | test("^[A-Za-z0-9][A-Za-z0-9._-]*$") | not) or
+              (.value | type != "string") or
+              (.value | length == 0) or
+              (.value | length > 2048) or
+              (.value | startswith("-")) or
+              (.value | test("[\u0000-\u0020\u007F]"))
+            ) then
+              error("composer_repositories contains an invalid name or URL")
+            else
+              .
+            end
+          ' <<< "$COMPOSER_REPOSITORIES"); then
+            echo 'Invalid Composer repository configuration: expected a JSON object of safe names and non-empty VCS URLs.' >&2
+            exit 1
+          fi
+
+          echo "composer_repositories=$normalized_repositories" >> "$GITHUB_OUTPUT"
+
   tests:
     name: Pest (PHP ${{ matrix.php }})
     needs: configuration
@@ -107,6 +147,22 @@ jobs:
           tools: composer:v2
         env:
           fail-fast: true
+
+      - name: Configure Composer repositories
+        shell: bash
+        env:
+          COMPOSER_REPOSITORIES: ${{ needs.configuration.outputs.composer_repositories }}
+          COMPOSER_TOKEN: ${{ secrets.composer_token }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$COMPOSER_TOKEN" ]]; then
+            composer config --global --auth github-oauth.github.com "$COMPOSER_TOKEN"
+          fi
+
+          while IFS=$'\t' read -r name url; do
+            composer repo add --global "$name" vcs "$url"
+          done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' <<< "$COMPOSER_REPOSITORIES")
 
       - name: Install dependencies
         run: composer install --prefer-dist --no-progress --no-interaction
@@ -138,6 +194,22 @@ jobs:
         env:
           fail-fast: true
 
+      - name: Configure Composer repositories
+        shell: bash
+        env:
+          COMPOSER_REPOSITORIES: ${{ needs.configuration.outputs.composer_repositories }}
+          COMPOSER_TOKEN: ${{ secrets.composer_token }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$COMPOSER_TOKEN" ]]; then
+            composer config --global --auth github-oauth.github.com "$COMPOSER_TOKEN"
+          fi
+
+          while IFS=$'\t' read -r name url; do
+            composer repo add --global "$name" vcs "$url"
+          done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' <<< "$COMPOSER_REPOSITORIES")
+
       - name: Install dependencies
         run: composer install --prefer-dist --no-progress --no-interaction
 
@@ -162,6 +234,22 @@ jobs:
           tools: composer:v2
         env:
           fail-fast: true
+
+      - name: Configure Composer repositories
+        shell: bash
+        env:
+          COMPOSER_REPOSITORIES: ${{ needs.configuration.outputs.composer_repositories }}
+          COMPOSER_TOKEN: ${{ secrets.composer_token }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$COMPOSER_TOKEN" ]]; then
+            composer config --global --auth github-oauth.github.com "$COMPOSER_TOKEN"
+          fi
+
+          while IFS=$'\t' read -r name url; do
+            composer repo add --global "$name" vcs "$url"
+          done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' <<< "$COMPOSER_REPOSITORIES")
 
       - name: Install lowest dependencies
         run: composer update --prefer-lowest --prefer-stable --prefer-dist --no-progress --no-interaction

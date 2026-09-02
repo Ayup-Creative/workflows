@@ -7,6 +7,9 @@ name: Tests
     branches: [main, dev]
     types: [opened, synchronize, reopened]
   workflow_call:
+    secrets:
+      COMPOSER_TOKEN:
+        required: false
 
 permissions:
   contents: read
@@ -18,3 +21,7 @@ jobs:
     with:
       php_versions: '["8.3","8.4","8.5"]'
       phpstan_php_version: '8.4'
+      composer_repositories: >-
+        {"vendor-package":"https://github.com/example/vendor-package.git"}
+    secrets:
+      composer_token: ${{ secrets.COMPOSER_TOKEN }}

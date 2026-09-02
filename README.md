@@ -21,6 +21,10 @@ jobs:
     with:
       php_versions: '["8.3","8.4","8.5"]'
       phpstan_php_version: '8.4'
+      composer_repositories: >-
+        {"vendor-package":"https://github.com/example/vendor-package.git"}
+    secrets:
+      composer_token: ${{ secrets.COMPOSER_TOKEN }}
 ```
 
 The reusable test workflow accepts these inputs:
@@ -30,9 +34,20 @@ The reusable test workflow accepts these inputs:
 | `php_versions` | `["8.3","8.4","8.5"]` | JSON array used by the Pest matrix. |
 | `phpstan_php_version` | `8.4` | PHP version used for PHPStan. |
 | `lowest_php_version` | empty | PHP version used with `--prefer-lowest`; an empty value selects the highest version in `php_versions`. |
+| `composer_repositories` | `{}` | JSON object mapping generic repository names to private VCS URLs. |
 
 Versions must be unique numeric `major.minor` or `major.minor.patch` strings.
 An explicit `lowest_php_version` does not need to appear in `php_versions`.
+
+The optional `composer_token` secret authenticates Composer with GitHub before
+private VCS repositories are added. Callers without private dependencies omit
+both settings. Repository names and URLs are supplied entirely by the caller;
+the shared workflow contains no project-specific package list.
+
+For private GitHub repositories, use a fine-grained token with read-only
+`Contents` access to the required dependency repositories. Store it as an
+Actions repository or organization secret in the caller; never place the token
+inside the repository JSON or commit Composer authentication files.
 
 The workflow runs Composer validation, Pint, and Pest with 100% coverage for
 each test-matrix version. PHPStan and lowest-dependency testing run once on

@@ -5,6 +5,7 @@ require 'minitest/autorun'
 require 'open3'
 require 'pathname'
 require 'tempfile'
+require 'tmpdir'
 require 'yaml'
 
 class WorkflowsTest < Minitest::Test
@@ -29,6 +30,100 @@ class WorkflowsTest < Minitest::Test
     assert_equal '["8.3","8.4","8.5"]', inputs.dig('php_versions', 'default')
     assert_equal '8.4', inputs.dig('phpstan_php_version', 'default')
     assert_equal '', inputs.dig('lowest_php_version', 'default')
+  end
+
+  def test_tests_workflow_exposes_optional_composer_repository_configuration
+    inputs = workflow_call_inputs(tests_workflow)
+    secrets = tests_workflow.dig('on', 'workflow_call', 'secrets')
+
+    assert_equal 'string', inputs.dig('composer_repositories', 'type')
+    assert_equal '{}', inputs.dig('composer_repositories', 'default')
+    assert_equal false, secrets.dig('composer_token', 'required')
+  end
+
+  def test_composer_repositories_are_normalized_before_quality_jobs_start
+    repositories = {
+      'framework' => 'https://github.com/example/framework.git',
+      'database' => 'https://github.com/example/database.git'
+    }
+    result = resolve_composer_repositories(JSON.generate(repositories))
+
+    assert_predicate result, :success?, result.stderr
+    assert_equal repositories, JSON.parse(result.outputs.fetch('composer_repositories'))
+  end
+
+  def test_invalid_composer_repository_configuration_fails_closed
+    invalid_inputs = [
+      '[]',
+      '{"invalid name":"https://github.com/example/package.git"}',
+      '{"package":false}',
+      '{"package":""}',
+      '{"package":"--no-interaction"}',
+      '{"package":"https://example.com/package.git\\nunsafe"}'
+    ]
+
+    invalid_inputs.each do |repositories|
+      result = resolve_composer_repositories(repositories)
+
+      refute_predicate result, :success?, "Expected #{repositories.inspect} to fail"
+      assert_includes result.stderr, 'Invalid Composer repository configuration'
+    end
+  end
+
+  def test_composer_setup_configures_generic_vcs_repositories_and_optional_authentication
+    script = composer_setup_script
+
+    Dir.mktmpdir('composer-setup') do |directory|
+      calls = File.join(directory, 'calls')
+      composer = File.join(directory, 'composer')
+      File.write(composer, "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$COMPOSER_CALLS\"\n")
+      File.chmod(0o755, composer)
+
+      repositories = JSON.generate(
+        'framework' => 'https://github.com/example/framework.git',
+        'database' => 'https://github.com/example/database.git'
+      )
+      _stdout, stderr, status = Open3.capture3(
+        {
+          'PATH' => "#{directory}:#{ENV.fetch('PATH')}",
+          'COMPOSER_CALLS' => calls,
+          'COMPOSER_REPOSITORIES' => repositories,
+          'COMPOSER_TOKEN' => 'private-token'
+        },
+        'bash',
+        stdin_data: script
+      )
+
+      assert_predicate status, :success?, stderr
+      assert_equal [
+        'config --global --auth github-oauth.github.com private-token',
+        'repo add --global framework vcs https://github.com/example/framework.git',
+        'repo add --global database vcs https://github.com/example/database.git'
+      ], File.readlines(calls, chomp: true)
+    end
+  end
+
+  def test_composer_setup_is_a_no_op_for_projects_without_private_repositories
+    Dir.mktmpdir('composer-setup') do |directory|
+      calls = File.join(directory, 'calls')
+      composer = File.join(directory, 'composer')
+      File.write(composer, "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$COMPOSER_CALLS\"\n")
+      File.chmod(0o755, composer)
+
+      _stdout, stderr, status = Open3.capture3(
+        {
+          'PATH' => "#{directory}:#{ENV.fetch('PATH')}",
+          'COMPOSER_CALLS' => calls,
+          'COMPOSER_REPOSITORIES' => '{}',
+          'COMPOSER_TOKEN' => ''
+        },
+        'bash',
+        stdin_data: composer_setup_script
+      )
+
+      assert_predicate status, :success?, stderr
+      refute File.exist?(calls)
+    end
   end
 
   def test_tests_workflow_routes_resolved_versions_to_each_quality_job
@@ -231,5 +326,41 @@ class WorkflowsTest < Minitest::Test
         outputs: output.each_line(chomp: true).to_h { |line| line.split('=', 2) }
       )
     end
+  end
+
+  def resolve_composer_repositories(repositories)
+    step = tests_workflow.dig('jobs', 'configuration', 'steps').find do |candidate|
+      candidate['id'] == 'composer'
+    end
+
+    Tempfile.create('github-output') do |output|
+      _stdout, stderr, status = Open3.capture3(
+        {
+          'COMPOSER_REPOSITORIES' => repositories,
+          'GITHUB_OUTPUT' => output.path
+        },
+        'bash',
+        stdin_data: step.fetch('run')
+      )
+      output.rewind
+
+      return ResolutionResult.new(
+        status: status,
+        stderr: stderr,
+        outputs: output.each_line(chomp: true).to_h { |line| line.split('=', 2) }
+      )
+    end
+  end
+
+  def composer_setup_script
+    jobs = tests_workflow.fetch('jobs')
+    scripts = %w[tests analysis lowest].map do |job|
+      jobs.fetch(job).fetch('steps').find { |step| step['name'] == 'Configure Composer repositories' }&.fetch('run')
+    end
+
+    assert scripts.all?
+    assert_equal 1, scripts.uniq.length
+
+    scripts.first
   end
 end
