@@ -17,7 +17,7 @@ repositories owned by the same user to use these workflows.
 ```yaml
 jobs:
   quality:
-    uses: mykemeynell/workflows/.github/workflows/tests.yml@v1
+    uses: Ayup-Creative/workflows/.github/workflows/tests.yml@v1
     with:
       php_versions: '["8.3","8.4","8.5"]'
       phpstan_php_version: '8.4'

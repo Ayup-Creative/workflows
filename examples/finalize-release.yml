@@ -25,7 +25,7 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
-    uses: mykemeynell/workflows/.github/workflows/release.yml@v1
+    uses: Ayup-Creative/workflows/.github/workflows/release.yml@v1
     with:
       target_branch: main
       cleanup_release_branch: true

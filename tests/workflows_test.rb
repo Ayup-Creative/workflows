@@ -231,7 +231,7 @@ class WorkflowsTest < Minitest::Test
     assert_equal %w[dev main], triggers.dig('pull_request', 'branches').sort
     assert_equal %w[opened reopened synchronize], triggers.dig('pull_request', 'types').sort
     assert triggers.key?('workflow_call')
-    assert_equal 'mykemeynell/workflows/.github/workflows/tests.yml@v1',
+    assert_equal 'Ayup-Creative/workflows/.github/workflows/tests.yml@v1',
                  tests_caller.dig('jobs', 'quality', 'uses')
   end
 
@@ -243,7 +243,7 @@ class WorkflowsTest < Minitest::Test
     assert_equal 'preflight', jobs.dig('quality', 'needs')
     assert_equal 'quality', jobs.dig('release', 'needs')
     assert_equal './.github/workflows/tests.yml', jobs.dig('quality', 'uses')
-    assert_equal 'mykemeynell/workflows/.github/workflows/release.yml@v1',
+    assert_equal 'Ayup-Creative/workflows/.github/workflows/release.yml@v1',
                  jobs.dig('release', 'uses')
   end
 
