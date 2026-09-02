@@ -1,0 +1,202 @@
+name: Reusable PHP Tests
+
+"on":
+  workflow_call:
+    inputs:
+      php_versions:
+        description: JSON array of PHP versions used by the Pest matrix.
+        required: false
+        type: string
+        default: '["8.3","8.4","8.5"]'
+      phpstan_php_version:
+        description: PHP version used to run PHPStan.
+        required: false
+        type: string
+        default: '8.4'
+      lowest_php_version:
+        description: PHP version used for lowest dependencies; defaults to the highest test-matrix version.
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  configuration:
+    name: Resolve PHP versions
+    runs-on: ubuntu-latest
+    outputs:
+      php_versions: ${{ steps.versions.outputs.php_versions }}
+      phpstan_php_version: ${{ steps.versions.outputs.phpstan_php_version }}
+      lowest_php_version: ${{ steps.versions.outputs.lowest_php_version }}
+    steps:
+      - name: Validate PHP versions
+        id: versions
+        shell: bash
+        env:
+          PHP_VERSIONS: ${{ inputs.php_versions }}
+          PHPSTAN_PHP_VERSION: ${{ inputs.phpstan_php_version }}
+          LOWEST_PHP_VERSION: ${{ inputs.lowest_php_version }}
+        run: |
+          set -euo pipefail
+
+          version_pattern='^[0-9]+\.[0-9]+(\.[0-9]+)?$'
+
+          if ! normalized_versions=$(jq -ce --arg pattern "$version_pattern" '
+            if type != "array" then
+              error("php_versions must be a JSON array")
+            elif length == 0 then
+              error("php_versions must contain at least one version")
+            elif any(.[]; type != "string" or (test($pattern) | not)) then
+              error("php_versions entries must be numeric major.minor or major.minor.patch strings")
+            elif (unique | length) != length then
+              error("php_versions must not contain duplicates")
+            else
+              .
+            end
+          ' <<< "$PHP_VERSIONS"); then
+            echo 'Invalid PHP version configuration: php_versions must be a non-empty JSON array of unique numeric version strings.' >&2
+            exit 1
+          fi
+
+          if ! jq -en --arg version "$PHPSTAN_PHP_VERSION" --arg pattern "$version_pattern" \
+            '$version | test($pattern)' >/dev/null; then
+            echo 'Invalid PHP version configuration: phpstan_php_version must be a numeric version string.' >&2
+            exit 1
+          fi
+
+          if [[ -n "$LOWEST_PHP_VERSION" ]] && \
+            ! jq -en --arg version "$LOWEST_PHP_VERSION" --arg pattern "$version_pattern" \
+              '$version | test($pattern)' >/dev/null; then
+            echo 'Invalid PHP version configuration: lowest_php_version must be empty or a numeric version string.' >&2
+            exit 1
+          fi
+
+          resolved_lowest_version="$LOWEST_PHP_VERSION"
+
+          if [[ -z "$resolved_lowest_version" ]]; then
+            resolved_lowest_version=$(jq -r '
+              sort_by(split(".") | map(tonumber)) | last
+            ' <<< "$normalized_versions")
+          fi
+
+          {
+            echo "php_versions=$normalized_versions"
+            echo "phpstan_php_version=$PHPSTAN_PHP_VERSION"
+            echo "lowest_php_version=$resolved_lowest_version"
+          } >> "$GITHUB_OUTPUT"
+
+  tests:
+    name: Pest (PHP ${{ matrix.php }})
+    needs: configuration
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ${{ fromJSON(needs.configuration.outputs.php_versions) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring, bcmath, pdo, sqlite
+          coverage: xdebug
+          tools: composer:v2
+        env:
+          fail-fast: true
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress --no-interaction
+
+      - name: Validate Composer
+        run: composer validate --strict
+
+      - name: Check code style
+        run: composer lint:check
+
+      - name: Run tests
+        env:
+          XDEBUG_MODE: coverage
+        run: composer test -- --coverage --min=100
+
+  analysis:
+    name: PHPStan (PHP ${{ needs.configuration.outputs.phpstan_php_version }})
+    needs: configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ needs.configuration.outputs.phpstan_php_version }}
+          coverage: none
+          tools: composer:v2
+        env:
+          fail-fast: true
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress --no-interaction
+
+      - name: Install analysis tools
+        run: composer analyze:install
+
+      - name: Run static analysis
+        run: composer analyze
+
+  lowest:
+    name: Lowest dependencies (PHP ${{ needs.configuration.outputs.lowest_php_version }})
+    needs: configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ needs.configuration.outputs.lowest_php_version }}
+          coverage: none
+          tools: composer:v2
+        env:
+          fail-fast: true
+
+      - name: Install lowest dependencies
+        run: composer update --prefer-lowest --prefer-stable --prefer-dist --no-progress --no-interaction
+
+      - name: Validate Composer
+        run: composer validate --strict
+
+      - name: Check code style
+        run: composer lint:check
+
+      - name: Run tests
+        run: composer test
+
+  quality:
+    name: Quality gate
+    if: ${{ always() }}
+    needs: [configuration, tests, analysis, lowest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs
+        env:
+          CONFIGURATION_RESULT: ${{ needs.configuration.result }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+          ANALYSIS_RESULT: ${{ needs.analysis.result }}
+          LOWEST_RESULT: ${{ needs.lowest.result }}
+        run: |
+          set -euo pipefail
+
+          for result in \
+            "$CONFIGURATION_RESULT" \
+            "$TESTS_RESULT" \
+            "$ANALYSIS_RESULT" \
+            "$LOWEST_RESULT"; do
+            if [[ "$result" != 'success' ]]; then
+              echo 'One or more required quality jobs did not succeed.' >&2
+              exit 1
+            fi
+          done

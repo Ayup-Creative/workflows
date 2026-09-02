@@ -1,0 +1,29 @@
+name: Finalize Release
+
+"on":
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality
+    if: >-
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'release-please')
+    uses: ./.github/workflows/tests.yml
+
+  release:
+    name: Create GitHub release
+    needs: quality
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: mykemeynell/workflows/.github/workflows/release.yml@v1
+    with:
+      target_branch: main
+      cleanup_release_branch: true

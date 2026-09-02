@@ -1,0 +1,40 @@
+name: Release
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Verify release branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require main
+        shell: bash
+        env:
+          CURRENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$CURRENT_REF" != 'refs/heads/main' ]]; then
+            echo "Releases may only be requested from refs/heads/main; received ${CURRENT_REF}." >&2
+            exit 1
+          fi
+
+  quality:
+    name: Quality
+    needs: preflight
+    uses: ./.github/workflows/tests.yml
+
+  release:
+    name: Release Please
+    needs: quality
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: mykemeynell/workflows/.github/workflows/release.yml@v1
+    with:
+      target_branch: main

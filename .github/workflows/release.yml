@@ -1,0 +1,72 @@
+name: Reusable Release Please
+
+"on":
+  workflow_call:
+    inputs:
+      target_branch:
+        description: Branch from which releases may be proposed or created.
+        required: false
+        type: string
+        default: main
+      cleanup_release_branch:
+        description: Delete the merged release-please branch after a release is created.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please-${{ github.repository }}-${{ inputs.target_branch }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release Please
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Verify target branch
+        shell: bash
+        env:
+          CURRENT_REF: ${{ github.ref }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$CURRENT_REF" != "refs/heads/${TARGET_BRANCH}" ]]; then
+            echo "Release Please may only run from refs/heads/${TARGET_BRANCH}; received ${CURRENT_REF}." >&2
+            exit 1
+          fi
+
+      - name: Run Release Please
+        id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          release-type: php
+          target-branch: ${{ inputs.target_branch }}
+          token: ${{ github.token }}
+
+      - name: Delete release-please branch
+        if: ${{ inputs.cleanup_release_branch && steps.release.outputs.release_created == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BRANCH: ${{ github.event.pull_request.head.ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          case "$RELEASE_BRANCH" in
+            release-please*) ;;
+            *)
+              echo "Refusing to delete non-release branch: ${RELEASE_BRANCH:-<empty>}." >&2
+              exit 1
+              ;;
+          esac
+
+          gh api --method DELETE "repos/${REPOSITORY}/git/refs/heads/${RELEASE_BRANCH}"
