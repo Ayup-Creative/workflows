@@ -1,0 +1,298 @@
+# .github/workflows/weekly-release.yml
+
+name: Weekly Release
+
+on:
+  workflow_call:
+    inputs:
+      development-branch:
+        description: Branch containing release candidates.
+        required: false
+        default: dev
+        type: string
+
+      release-branch:
+        description: Branch containing released code.
+        required: false
+        default: main
+        type: string
+
+      required-check:
+        description: Name of the check that must pass on the development branch.
+        required: false
+        default: Release Gate
+        type: string
+
+      release-type:
+        description: Release Please release strategy.
+        required: false
+        default: php
+        type: string
+
+      promotion-title:
+        description: Title used for the automated promotion pull request.
+        required: false
+        default: "chore: promote dev to main"
+        type: string
+
+      auto-merge:
+        description: Automatically merge the promotion PR once branch protection permits it.
+        required: false
+        default: true
+        type: boolean
+
+    secrets:
+      release-token:
+        description: Fine-grained PAT or GitHub App token used for promotion and release automation.
+        required: true
+
+permissions:
+  contents: write
+  checks: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: weekly-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    name: Inspect release candidate
+    runs-on: ubuntu-latest
+
+    outputs:
+      development-sha: ${{ steps.development.outputs.sha }}
+      ahead: ${{ steps.compare.outputs.ahead }}
+      behind: ${{ steps.compare.outputs.behind }}
+      status: ${{ steps.compare.outputs.status }}
+      release-required: ${{ steps.compare.outputs.release-required }}
+
+    steps:
+      - name: Resolve development branch
+        id: development
+        env:
+          GH_TOKEN: ${{ secrets.release-token }}
+          REPOSITORY: ${{ github.repository }}
+          DEVELOPMENT_BRANCH: ${{ inputs.development-branch }}
+        run: |
+          SHA="$(
+            gh api \
+              "repos/${REPOSITORY}/git/ref/heads/${DEVELOPMENT_BRANCH}" \
+              --jq '.object.sha'
+          )"
+
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Development SHA: $SHA"
+
+      - name: Verify required check
+        env:
+          GH_TOKEN: ${{ secrets.release-token }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ steps.development.outputs.sha }}
+          REQUIRED_CHECK: ${{ inputs.required-check }}
+        run: |
+          CHECK="$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${REPOSITORY}/commits/${SHA}/check-runs?check_name=${REQUIRED_CHECK}&filter=latest&per_page=100" \
+              --jq '
+                .check_runs
+                | sort_by(.completed_at // .started_at)
+                | reverse
+                | .[0]
+              '
+          )"
+
+          if [[ "$CHECK" == "null" || -z "$CHECK" ]]; then
+            echo "::error::Required check '${REQUIRED_CHECK}' was not found for ${SHA}."
+            exit 1
+          fi
+
+          STATUS="$(jq -r '.status' <<< "$CHECK")"
+          CONCLUSION="$(jq -r '.conclusion // empty' <<< "$CHECK")"
+
+          echo "Check:      ${REQUIRED_CHECK}"
+          echo "Status:     ${STATUS}"
+          echo "Conclusion: ${CONCLUSION:-pending}"
+
+          if [[ "$STATUS" != "completed" ]]; then
+            echo "::error::Required check '${REQUIRED_CHECK}' has not completed."
+            exit 1
+          fi
+
+          if [[ "$CONCLUSION" != "success" ]]; then
+            echo "::error::Required check '${REQUIRED_CHECK}' did not succeed."
+            exit 1
+          fi
+
+      - name: Compare branches
+        id: compare
+        env:
+          GH_TOKEN: ${{ secrets.release-token }}
+          REPOSITORY: ${{ github.repository }}
+          DEVELOPMENT_BRANCH: ${{ inputs.development-branch }}
+          RELEASE_BRANCH: ${{ inputs.release-branch }}
+        run: |
+          COMPARISON="$(
+            gh api \
+              "repos/${REPOSITORY}/compare/${RELEASE_BRANCH}...${DEVELOPMENT_BRANCH}"
+          )"
+
+          STATUS="$(jq -r '.status' <<< "$COMPARISON")"
+          AHEAD="$(jq -r '.ahead_by' <<< "$COMPARISON")"
+          BEHIND="$(jq -r '.behind_by' <<< "$COMPARISON")"
+
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+
+          if [[ "$AHEAD" -gt 0 ]]; then
+            echo "release-required=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release-required=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "### Branch comparison"
+            echo ""
+            echo "| Branch | Value |"
+            echo "|---|---:|"
+            echo "| Development | \`${DEVELOPMENT_BRANCH}\` |"
+            echo "| Release | \`${RELEASE_BRANCH}\` |"
+            echo "| Ahead | ${AHEAD} |"
+            echo "| Behind | ${BEHIND} |"
+            echo "| Status | \`${STATUS}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Nothing to release
+        if: steps.compare.outputs.release-required == 'false'
+        env:
+          DEVELOPMENT_BRANCH: ${{ inputs.development-branch }}
+          RELEASE_BRANCH: ${{ inputs.release-branch }}
+        run: |
+          {
+            echo ""
+            echo "### Nothing to release 🎉"
+            echo ""
+            echo "\`${DEVELOPMENT_BRANCH}\` contains no commits that need promoting to \`${RELEASE_BRANCH}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    name: Promote development branch
+    needs: inspect
+
+    if: needs.inspect.outputs.release-required == 'true'
+
+    runs-on: ubuntu-latest
+
+    outputs:
+      pull-request: ${{ steps.pr.outputs.number }}
+
+    steps:
+      - name: Find or create promotion pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.release-token }}
+          DEVELOPMENT_BRANCH: ${{ inputs.development-branch }}
+          RELEASE_BRANCH: ${{ inputs.release-branch }}
+          PROMOTION_TITLE: ${{ inputs.promotion-title }}
+        run: |
+          NUMBER="$(
+            gh pr list \
+              --repo "${{ github.repository }}" \
+              --base "${RELEASE_BRANCH}" \
+              --head "${DEVELOPMENT_BRANCH}" \
+              --state open \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+
+          if [[ -z "$NUMBER" ]]; then
+            URL="$(
+              gh pr create \
+                --repo "${{ github.repository }}" \
+                --base "${RELEASE_BRANCH}" \
+                --head "${DEVELOPMENT_BRANCH}" \
+                --title "${PROMOTION_TITLE}" \
+                --body "Automated promotion of \`${DEVELOPMENT_BRANCH}\` to \`${RELEASE_BRANCH}\` after the configured release gate passed."
+            )"
+
+            NUMBER="${URL##*/}"
+
+            echo "Created promotion PR #${NUMBER}"
+          else
+            echo "Using existing promotion PR #${NUMBER}"
+          fi
+
+          echo "number=$NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Enable automatic merge
+        if: inputs.auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.release-token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          gh pr merge \
+            "${PR_NUMBER}" \
+            --repo "${{ github.repository }}" \
+            --merge \
+            --auto
+
+      - name: Merge immediately
+        if: ${{ !inputs.auto-merge }}
+        env:
+          GH_TOKEN: ${{ secrets.release-token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          gh pr merge \
+            "${PR_NUMBER}" \
+            --repo "${{ github.repository }}" \
+            --merge
+
+  release:
+    name: Prepare release
+    needs:
+      - inspect
+      - promote
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Wait for promotion to reach release branch
+        env:
+          GH_TOKEN: ${{ secrets.release-token }}
+          DEVELOPMENT_BRANCH: ${{ inputs.development-branch }}
+          RELEASE_BRANCH: ${{ inputs.release-branch }}
+        run: |
+          for attempt in {1..30}; do
+            DEVELOPMENT_SHA="$(
+              gh api \
+                "repos/${{ github.repository }}/git/ref/heads/${DEVELOPMENT_BRANCH}" \
+                --jq '.object.sha'
+            )"
+
+            COMPARISON="$(
+              gh api \
+                "repos/${{ github.repository }}/compare/${RELEASE_BRANCH}...${DEVELOPMENT_SHA}"
+            )"
+
+            AHEAD="$(jq -r '.ahead_by' <<< "$COMPARISON")"
+
+            if [[ "$AHEAD" == "0" ]]; then
+              echo "Promotion is present on ${RELEASE_BRANCH}."
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "::error::Promotion did not reach ${RELEASE_BRANCH}."
+          exit 1
+
+      - name: Release Please
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.release-token }}
+          release-type: ${{ inputs.release-type }}
+          target-branch: ${{ inputs.release-branch }}
