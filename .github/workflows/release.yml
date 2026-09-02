@@ -3,70 +3,266 @@ name: Reusable Release Please
 "on":
   workflow_call:
     inputs:
-      target_branch:
-        description: Branch from which releases may be proposed or created.
+      release_branch:
+        description: Branch on which Release Please manages releases.
         required: false
-        type: string
         default: main
-      cleanup_release_branch:
-        description: Delete the merged release-please branch after a release is created.
+        type: string
+      release_type:
+        description: Release Please release strategy.
         required: false
+        default: php
+        type: string
+      auto_merge:
+        description: Enable protected auto-merge for Release Please pull requests.
+        required: false
+        default: true
         type: boolean
-        default: false
+      merge_method:
+        description: Release PR merge method; merge, rebase, squash, or queue.
+        required: false
+        default: merge
+        type: string
+    secrets:
+      RELEASE_TOKEN:
+        description: Fine-grained PAT used for release mutations.
+        required: false
+      RELEASE_APP_CLIENT_ID:
+        description: Client ID for a GitHub App installed on the caller repository.
+        required: false
+      RELEASE_APP_PRIVATE_KEY:
+        description: Private key for a GitHub App installed on the caller repository.
+        required: false
+    outputs:
+      releases_created:
+        description: Whether Release Please created any GitHub releases.
+        value: ${{ jobs.release.outputs.releases_created }}
+      prs_created:
+        description: Whether Release Please created or updated any release pull requests.
+        value: ${{ jobs.release.outputs.prs_created }}
+      paths_released:
+        description: JSON array of released paths.
+        value: ${{ jobs.release.outputs.paths_released }}
+      version:
+        description: Root component SemVer version, when released.
+        value: ${{ jobs.release.outputs.version }}
+      tag_name:
+        description: Root component tag, when released.
+        value: ${{ jobs.release.outputs.tag_name }}
+      release_url:
+        description: Root component GitHub Release URL, when released.
+        value: ${{ jobs.release.outputs.release_url }}
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-please-${{ github.repository }}-${{ inputs.target_branch }}
+  group: release-${{ github.repository }}-${{ inputs.release_branch }}
   cancel-in-progress: false
 
 jobs:
   release:
-    name: Release Please
+    name: Prepare or create release
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      issues: write
-      pull-requests: write
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      prs_created: ${{ steps.release.outputs.prs_created }}
+      paths_released: ${{ steps.release.outputs.paths_released }}
+      version: ${{ steps.release.outputs.version }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      release_url: ${{ steps.release.outputs.html_url }}
     steps:
-      - name: Verify target branch
+      - name: Validate release configuration
         shell: bash
         env:
           CURRENT_REF: ${{ github.ref }}
-          TARGET_BRANCH: ${{ inputs.target_branch }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          MERGE_METHOD: ${{ inputs.merge_method }}
         run: |
           set -euo pipefail
 
-          if [[ "$CURRENT_REF" != "refs/heads/${TARGET_BRANCH}" ]]; then
-            echo "Release Please may only run from refs/heads/${TARGET_BRANCH}; received ${CURRENT_REF}." >&2
+          git check-ref-format "refs/heads/${RELEASE_BRANCH}" >/dev/null
+
+          if [[ "$CURRENT_REF" != "refs/heads/${RELEASE_BRANCH}" ]]; then
+            echo "Release Please may only run from refs/heads/${RELEASE_BRANCH}; received ${CURRENT_REF}." >&2
             exit 1
           fi
 
-      - name: Run Release Please
-        id: release
-        uses: googleapis/release-please-action@v5
-        with:
-          release-type: php
-          target-branch: ${{ inputs.target_branch }}
-          token: ${{ github.token }}
+          if [[ ! "$RELEASE_TYPE" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            echo 'The release type must be a non-empty Release Please strategy name.' >&2
+            exit 1
+          fi
 
-      - name: Delete release-please branch
-        if: ${{ inputs.cleanup_release_branch && steps.release.outputs.release_created == 'true' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_BRANCH: ${{ github.event.pull_request.head.ref }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-
-          case "$RELEASE_BRANCH" in
-            release-please*) ;;
+          case "$MERGE_METHOD" in
+            merge|rebase|squash|queue) ;;
             *)
-              echo "Refusing to delete non-release branch: ${RELEASE_BRANCH:-<empty>}." >&2
+              echo "Unsupported release merge method: ${MERGE_METHOD}." >&2
               exit 1
               ;;
           esac
 
-          gh api --method DELETE "repos/${REPOSITORY}/git/refs/heads/${RELEASE_BRANCH}"
+      - name: Validate release authentication
+        id: authentication
+        shell: bash
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$RELEASE_TOKEN" ]]; then
+            if [[ -n "$RELEASE_APP_CLIENT_ID" || -n "$RELEASE_APP_PRIVATE_KEY" ]]; then
+              echo 'Configure either RELEASE_TOKEN or GitHub App credentials, not both.' >&2
+              exit 1
+            fi
+
+            echo 'mode=token' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -n "$RELEASE_APP_CLIENT_ID" && -n "$RELEASE_APP_PRIVATE_KEY" ]]; then
+            echo 'mode=app' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo 'Configure RELEASE_TOKEN or both RELEASE_APP_CLIENT_ID and RELEASE_APP_PRIVATE_KEY.' >&2
+          exit 1
+
+      - name: Create GitHub App token
+        id: app-token
+        if: ${{ steps.authentication.outputs.mode == 'app' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Run Release Please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+        with:
+          token: ${{ secrets.RELEASE_TOKEN || steps.app-token.outputs.token }}
+          release-type: ${{ inputs.release_type }}
+          target-branch: ${{ inputs.release_branch }}
+
+      - name: Configure release auto-merge
+        id: auto-merge
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          PULL_REQUESTS: ${{ steps.release.outputs.prs || '[]' }}
+          AUTO_MERGE: ${{ inputs.auto_merge }}
+          MERGE_METHOD: ${{ inputs.merge_method }}
+        run: |
+          set -euo pipefail
+
+          if ! jq -e 'type == "array"' <<< "$PULL_REQUESTS" >/dev/null; then
+            echo 'Release Please returned invalid pull request metadata.' >&2
+            exit 1
+          fi
+
+          mapfile -t pull_request_numbers < <(jq -er '.[].number' <<< "$PULL_REQUESTS")
+
+          if (( ${#pull_request_numbers[@]} == 0 )); then
+            echo 'Release Please reported a pull request without returning its metadata.' >&2
+            exit 1
+          fi
+
+          if [[ "$AUTO_MERGE" != 'true' ]]; then
+            echo 'auto_merge_state=disabled' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          requested=0
+          already_enabled=0
+
+          for number in "${pull_request_numbers[@]}"; do
+            PULL_REQUEST="$(
+              gh pr view "$number" \
+                --repo "$REPOSITORY" \
+                --json autoMergeRequest,headRefOid,isDraft
+            )"
+            HEAD_SHA="$(jq -er '.headRefOid' <<< "$PULL_REQUEST")"
+            IS_DRAFT="$(jq -r '.isDraft' <<< "$PULL_REQUEST")"
+
+            if [[ "$IS_DRAFT" == 'true' ]]; then
+              echo "Release Please pull request #${number} is a draft." >&2
+              exit 1
+            fi
+
+            if [[ "$(jq -r '.autoMergeRequest != null' <<< "$PULL_REQUEST")" == 'true' ]]; then
+              ((already_enabled += 1))
+              continue
+            fi
+
+            merge_arguments=()
+            case "$MERGE_METHOD" in
+              merge) merge_arguments+=(--merge) ;;
+              rebase) merge_arguments+=(--rebase) ;;
+              squash) merge_arguments+=(--squash) ;;
+              queue) ;;
+            esac
+
+            gh pr merge "$number" \
+              --repo "$REPOSITORY" \
+              --auto \
+              --match-head-commit "$HEAD_SHA" \
+              "${merge_arguments[@]}"
+
+            ((requested += 1))
+          done
+
+          echo "auto_merge_state=requested:${requested},already-enabled:${already_enabled}" >> "$GITHUB_OUTPUT"
+
+      - name: Write release summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          RELEASES_CREATED: ${{ steps.release.outputs.releases_created }}
+          PULL_REQUESTS_CREATED: ${{ steps.release.outputs.prs_created }}
+          PATHS_RELEASED: ${{ steps.release.outputs.paths_released }}
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+          RELEASE_URL: ${{ steps.release.outputs.html_url }}
+          AUTO_MERGE_STATE: ${{ steps.auto-merge.outputs.auto_merge_state }}
+        run: |
+          set -euo pipefail
+
+          OUTCOME=no_release_change
+          if [[ "$RELEASES_CREATED" == 'true' ]]; then
+            OUTCOME=release_created
+          elif [[ "$PULL_REQUESTS_CREATED" == 'true' ]]; then
+            OUTCOME=release_pr_prepared
+          fi
+
+          {
+            echo '## Release Please'
+            echo ''
+            echo '| Item | Result |'
+            echo '|---|---|'
+            echo "| Release branch | \`${RELEASE_BRANCH}\` |"
+            echo "| Release type | \`${RELEASE_TYPE}\` |"
+            echo "| Outcome | \`${OUTCOME}\` |"
+            echo "| Release PR created or updated | \`${PULL_REQUESTS_CREATED:-false}\` |"
+            echo "| Auto-merge | \`${AUTO_MERGE_STATE:-not-requested}\` |"
+            echo "| GitHub Release created | \`${RELEASES_CREATED:-false}\` |"
+            echo "| Released paths | \`${PATHS_RELEASED:-[]}\` |"
+
+            if [[ -n "$TAG_NAME" ]]; then
+              echo "| Tag | \`${TAG_NAME}\` |"
+              echo "| Version | \`${VERSION}\` |"
+            fi
+
+            if [[ -n "$RELEASE_URL" ]]; then
+              echo ''
+              echo "GitHub Release: ${RELEASE_URL}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,24 +1,19 @@
-# .github/workflows/release.yml
+# .github/workflows/weekly-release.yml
 
-name: Weekly Release
+name: Nightly Release Promotion
 
-on:
+"on":
   schedule:
-    # 0 3 * * 1 - Weekly
-    # 0 3 * * * - Nightly
-    - cron: '0 3 * * 1'
-
+    - cron: '17 3 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  checks: read
+  statuses: read
+
 jobs:
-  release:
-    uses: ayup-creative/workflows/.github/workflows/weekly-release.yml@v1
-
-    with:
-      development-branch: dev
-      release-branch: main
-      required-check: Release Gate
-      release-type: php
-
-    secrets:
-      release-token: ${{ secrets.RELEASE_TOKEN }}
+  promotion:
+    name: Promote green development code
+    uses: Ayup-Creative/workflows/.github/workflows/weekly-release.yml@v1
+    secrets: inherit

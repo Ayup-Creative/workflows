@@ -1,298 +1,590 @@
-# .github/workflows/weekly-release.yml
+name: Reusable Release Promotion
 
-name: Weekly Release
-
-on:
+"on":
   workflow_call:
     inputs:
-      development-branch:
+      development_branch:
         description: Branch containing release candidates.
         required: false
         default: dev
         type: string
-
-      release-branch:
+      release_branch:
         description: Branch containing released code.
         required: false
         default: main
         type: string
-
-      required-check:
-        description: Name of the check that must pass on the development branch.
+      required_check:
+        description: Exact name of the check or status required on the development commit.
         required: false
         default: Release Gate
         type: string
-
-      release-type:
-        description: Release Please release strategy.
+      required_check_kind:
+        description: GitHub gate provider; either check-run or status.
         required: false
-        default: php
+        default: check-run
         type: string
-
-      promotion-title:
+      required_check_app_id:
+        description: Optional GitHub App ID that must own the required check run.
+        required: false
+        default: ''
+        type: string
+      promotion_title:
         description: Title used for the automated promotion pull request.
         required: false
-        default: "chore: promote dev to main"
+        default: 'chore: promote dev to main'
         type: string
-
-      auto-merge:
-        description: Automatically merge the promotion PR once branch protection permits it.
+      auto_merge:
+        description: Enable protected auto-merge for the promotion pull request.
         required: false
         default: true
         type: boolean
-
+      merge_method:
+        description: Promotion merge method; merge, rebase, or queue.
+        required: false
+        default: merge
+        type: string
     secrets:
-      release-token:
-        description: Fine-grained PAT or GitHub App token used for promotion and release automation.
-        required: true
+      RELEASE_TOKEN:
+        description: Fine-grained PAT used for promotion mutations.
+        required: false
+      RELEASE_APP_CLIENT_ID:
+        description: Client ID for a GitHub App installed on the caller repository.
+        required: false
+      RELEASE_APP_PRIVATE_KEY:
+        description: Private key for a GitHub App installed on the caller repository.
+        required: false
+    outputs:
+      outcome:
+        description: Promotion outcome.
+        value: ${{ jobs.promotion.outputs.outcome }}
+      development_sha:
+        description: Development commit inspected by the workflow.
+        value: ${{ jobs.promotion.outputs.development_sha }}
+      promotion_pr_number:
+        description: Created or reused promotion pull request number.
+        value: ${{ jobs.promotion.outputs.promotion_pr_number }}
+      promotion_pr_url:
+        description: Created or reused promotion pull request URL.
+        value: ${{ jobs.promotion.outputs.promotion_pr_url }}
 
 permissions:
-  contents: write
+  contents: read
   checks: read
-  pull-requests: write
-  issues: write
+  statuses: read
 
 concurrency:
-  group: weekly-release-${{ github.repository }}
+  group: release-${{ github.repository }}-${{ inputs.release_branch }}
   cancel-in-progress: false
 
 jobs:
-  inspect:
-    name: Inspect release candidate
+  promotion:
+    name: Promote development branch
     runs-on: ubuntu-latest
-
     outputs:
-      development-sha: ${{ steps.development.outputs.sha }}
-      ahead: ${{ steps.compare.outputs.ahead }}
-      behind: ${{ steps.compare.outputs.behind }}
-      status: ${{ steps.compare.outputs.status }}
-      release-required: ${{ steps.compare.outputs.release-required }}
-
+      outcome: ${{ steps.summary.outputs.outcome }}
+      development_sha: ${{ steps.comparison.outputs.development_sha }}
+      promotion_pr_number: ${{ steps.promotion.outputs.promotion_pr_number }}
+      promotion_pr_url: ${{ steps.promotion.outputs.promotion_pr_url }}
     steps:
-      - name: Resolve development branch
-        id: development
+      - name: Validate promotion configuration
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.release-token }}
-          REPOSITORY: ${{ github.repository }}
-          DEVELOPMENT_BRANCH: ${{ inputs.development-branch }}
+          DEVELOPMENT_BRANCH: ${{ inputs.development_branch }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+          REQUIRED_CHECK: ${{ inputs.required_check }}
+          REQUIRED_CHECK_KIND: ${{ inputs.required_check_kind }}
+          REQUIRED_CHECK_APP_ID: ${{ inputs.required_check_app_id }}
+          PROMOTION_TITLE: ${{ inputs.promotion_title }}
+          MERGE_METHOD: ${{ inputs.merge_method }}
         run: |
-          SHA="$(
+          set -euo pipefail
+
+          git check-ref-format "refs/heads/${DEVELOPMENT_BRANCH}" >/dev/null
+          git check-ref-format "refs/heads/${RELEASE_BRANCH}" >/dev/null
+
+          if [[ "$DEVELOPMENT_BRANCH" == "$RELEASE_BRANCH" ]]; then
+            echo 'Development and release branches must be different.' >&2
+            exit 1
+          fi
+
+          if [[ -z "$REQUIRED_CHECK" || "$REQUIRED_CHECK" == *$'\n'* || "$REQUIRED_CHECK" == *$'\r'* ]]; then
+            echo 'The required check name must be a non-empty single line.' >&2
+            exit 1
+          fi
+
+          if [[ -z "$PROMOTION_TITLE" || "$PROMOTION_TITLE" == *$'\n'* || "$PROMOTION_TITLE" == *$'\r'* ]]; then
+            echo 'The promotion title must be a non-empty single line.' >&2
+            exit 1
+          fi
+
+          case "$REQUIRED_CHECK_KIND" in
+            check-run|status) ;;
+            *)
+              echo "Unsupported required check kind: ${REQUIRED_CHECK_KIND}." >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ -n "$REQUIRED_CHECK_APP_ID" ]]; then
+            if [[ "$REQUIRED_CHECK_KIND" != 'check-run' || ! "$REQUIRED_CHECK_APP_ID" =~ ^[0-9]+$ ]]; then
+              echo 'A required check App ID must be numeric and may only be used with check-run.' >&2
+              exit 1
+            fi
+          fi
+
+          case "$MERGE_METHOD" in
+            merge|rebase|queue) ;;
+            *)
+              echo "Unsupported promotion merge method: ${MERGE_METHOD}." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Compare release branches
+        id: comparison
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          DEVELOPMENT_BRANCH: ${{ inputs.development_branch }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+        run: |
+          set -euo pipefail
+
+          branch_sha() {
+            local encoded_branch
+            encoded_branch="$(jq -rn --arg value "$1" '$value | @uri')"
             gh api \
-              "repos/${REPOSITORY}/git/ref/heads/${DEVELOPMENT_BRANCH}" \
-              --jq '.object.sha'
-          )"
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/${REPOSITORY}/branches/${encoded_branch}" \
+              --jq '.commit.sha'
+          }
 
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "Development SHA: $SHA"
-
-      - name: Verify required check
-        env:
-          GH_TOKEN: ${{ secrets.release-token }}
-          REPOSITORY: ${{ github.repository }}
-          SHA: ${{ steps.development.outputs.sha }}
-          REQUIRED_CHECK: ${{ inputs.required-check }}
-        run: |
-          CHECK="$(
-            gh api \
-              -H "Accept: application/vnd.github+json" \
-              "repos/${REPOSITORY}/commits/${SHA}/check-runs?check_name=${REQUIRED_CHECK}&filter=latest&per_page=100" \
-              --jq '
-                .check_runs
-                | sort_by(.completed_at // .started_at)
-                | reverse
-                | .[0]
-              '
-          )"
-
-          if [[ "$CHECK" == "null" || -z "$CHECK" ]]; then
-            echo "::error::Required check '${REQUIRED_CHECK}' was not found for ${SHA}."
-            exit 1
-          fi
-
-          STATUS="$(jq -r '.status' <<< "$CHECK")"
-          CONCLUSION="$(jq -r '.conclusion // empty' <<< "$CHECK")"
-
-          echo "Check:      ${REQUIRED_CHECK}"
-          echo "Status:     ${STATUS}"
-          echo "Conclusion: ${CONCLUSION:-pending}"
-
-          if [[ "$STATUS" != "completed" ]]; then
-            echo "::error::Required check '${REQUIRED_CHECK}' has not completed."
-            exit 1
-          fi
-
-          if [[ "$CONCLUSION" != "success" ]]; then
-            echo "::error::Required check '${REQUIRED_CHECK}' did not succeed."
-            exit 1
-          fi
-
-      - name: Compare branches
-        id: compare
-        env:
-          GH_TOKEN: ${{ secrets.release-token }}
-          REPOSITORY: ${{ github.repository }}
-          DEVELOPMENT_BRANCH: ${{ inputs.development-branch }}
-          RELEASE_BRANCH: ${{ inputs.release-branch }}
-        run: |
+          DEVELOPMENT_SHA="$(branch_sha "$DEVELOPMENT_BRANCH")"
+          RELEASE_SHA="$(branch_sha "$RELEASE_BRANCH")"
           COMPARISON="$(
             gh api \
-              "repos/${REPOSITORY}/compare/${RELEASE_BRANCH}...${DEVELOPMENT_BRANCH}"
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/${REPOSITORY}/compare/${RELEASE_SHA}...${DEVELOPMENT_SHA}"
           )"
 
-          STATUS="$(jq -r '.status' <<< "$COMPARISON")"
-          AHEAD="$(jq -r '.ahead_by' <<< "$COMPARISON")"
-          BEHIND="$(jq -r '.behind_by' <<< "$COMPARISON")"
+          STATUS="$(jq -er '.status' <<< "$COMPARISON")"
+          AHEAD="$(jq -er '.ahead_by' <<< "$COMPARISON")"
+          BEHIND="$(jq -er '.behind_by' <<< "$COMPARISON")"
+          RELEASE_REQUIRED=false
 
-          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
-          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
-          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
-
-          if [[ "$AHEAD" -gt 0 ]]; then
-            echo "release-required=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "release-required=false" >> "$GITHUB_OUTPUT"
+          if (( AHEAD > 0 )); then
+            RELEASE_REQUIRED=true
           fi
 
           {
-            echo "### Branch comparison"
-            echo ""
-            echo "| Branch | Value |"
-            echo "|---|---:|"
-            echo "| Development | \`${DEVELOPMENT_BRANCH}\` |"
-            echo "| Release | \`${RELEASE_BRANCH}\` |"
-            echo "| Ahead | ${AHEAD} |"
-            echo "| Behind | ${BEHIND} |"
-            echo "| Status | \`${STATUS}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "development_sha=${DEVELOPMENT_SHA}"
+            echo "release_sha=${RELEASE_SHA}"
+            echo "comparison_status=${STATUS}"
+            echo "ahead=${AHEAD}"
+            echo "behind=${BEHIND}"
+            echo "release_required=${RELEASE_REQUIRED}"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Nothing to release
-        if: steps.compare.outputs.release-required == 'false'
+      - name: Evaluate release gate
+        id: gate
+        if: ${{ steps.comparison.outputs.release_required == 'true' }}
+        shell: bash
         env:
-          DEVELOPMENT_BRANCH: ${{ inputs.development-branch }}
-          RELEASE_BRANCH: ${{ inputs.release-branch }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          DEVELOPMENT_SHA: ${{ steps.comparison.outputs.development_sha }}
+          REQUIRED_CHECK: ${{ inputs.required_check }}
+          REQUIRED_CHECK_KIND: ${{ inputs.required_check_kind }}
+          REQUIRED_CHECK_APP_ID: ${{ inputs.required_check_app_id }}
         run: |
-          {
-            echo ""
-            echo "### Nothing to release 🎉"
-            echo ""
-            echo "\`${DEVELOPMENT_BRANCH}\` contains no commits that need promoting to \`${RELEASE_BRANCH}\`."
-          } >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
 
-  promote:
-    name: Promote development branch
-    needs: inspect
+          GATE_STATUS=missing
+          GATE_CONCLUSION=missing
+          GATE_DETAILS_URL=''
+          GATE_APP_ID=''
+          GATE_GREEN=false
+          GATE_REASON="Required ${REQUIRED_CHECK_KIND} '${REQUIRED_CHECK}' was not found."
 
-    if: needs.inspect.outputs.release-required == 'true'
+          if [[ "$REQUIRED_CHECK_KIND" == 'check-run' ]]; then
+            api_arguments=(
+              --method GET
+              -H 'Accept: application/vnd.github+json'
+              -H 'X-GitHub-Api-Version: 2026-03-10'
+              "repos/${REPOSITORY}/commits/${DEVELOPMENT_SHA}/check-runs"
+              -f "check_name=${REQUIRED_CHECK}"
+              -f 'filter=latest'
+              -f 'per_page=100'
+            )
 
-    runs-on: ubuntu-latest
-
-    outputs:
-      pull-request: ${{ steps.pr.outputs.number }}
-
-    steps:
-      - name: Find or create promotion pull request
-        id: pr
-        env:
-          GH_TOKEN: ${{ secrets.release-token }}
-          DEVELOPMENT_BRANCH: ${{ inputs.development-branch }}
-          RELEASE_BRANCH: ${{ inputs.release-branch }}
-          PROMOTION_TITLE: ${{ inputs.promotion-title }}
-        run: |
-          NUMBER="$(
-            gh pr list \
-              --repo "${{ github.repository }}" \
-              --base "${RELEASE_BRANCH}" \
-              --head "${DEVELOPMENT_BRANCH}" \
-              --state open \
-              --json number \
-              --jq '.[0].number // empty'
-          )"
-
-          if [[ -z "$NUMBER" ]]; then
-            URL="$(
-              gh pr create \
-                --repo "${{ github.repository }}" \
-                --base "${RELEASE_BRANCH}" \
-                --head "${DEVELOPMENT_BRANCH}" \
-                --title "${PROMOTION_TITLE}" \
-                --body "Automated promotion of \`${DEVELOPMENT_BRANCH}\` to \`${RELEASE_BRANCH}\` after the configured release gate passed."
-            )"
-
-            NUMBER="${URL##*/}"
-
-            echo "Created promotion PR #${NUMBER}"
-          else
-            echo "Using existing promotion PR #${NUMBER}"
-          fi
-
-          echo "number=$NUMBER" >> "$GITHUB_OUTPUT"
-
-      - name: Enable automatic merge
-        if: inputs.auto-merge
-        env:
-          GH_TOKEN: ${{ secrets.release-token }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-        run: |
-          gh pr merge \
-            "${PR_NUMBER}" \
-            --repo "${{ github.repository }}" \
-            --merge \
-            --auto
-
-      - name: Merge immediately
-        if: ${{ !inputs.auto-merge }}
-        env:
-          GH_TOKEN: ${{ secrets.release-token }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-        run: |
-          gh pr merge \
-            "${PR_NUMBER}" \
-            --repo "${{ github.repository }}" \
-            --merge
-
-  release:
-    name: Prepare release
-    needs:
-      - inspect
-      - promote
-
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Wait for promotion to reach release branch
-        env:
-          GH_TOKEN: ${{ secrets.release-token }}
-          DEVELOPMENT_BRANCH: ${{ inputs.development-branch }}
-          RELEASE_BRANCH: ${{ inputs.release-branch }}
-        run: |
-          for attempt in {1..30}; do
-            DEVELOPMENT_SHA="$(
-              gh api \
-                "repos/${{ github.repository }}/git/ref/heads/${DEVELOPMENT_BRANCH}" \
-                --jq '.object.sha'
-            )"
-
-            COMPARISON="$(
-              gh api \
-                "repos/${{ github.repository }}/compare/${RELEASE_BRANCH}...${DEVELOPMENT_SHA}"
-            )"
-
-            AHEAD="$(jq -r '.ahead_by' <<< "$COMPARISON")"
-
-            if [[ "$AHEAD" == "0" ]]; then
-              echo "Promotion is present on ${RELEASE_BRANCH}."
-              exit 0
+            if [[ -n "$REQUIRED_CHECK_APP_ID" ]]; then
+              api_arguments+=(-f "app_id=${REQUIRED_CHECK_APP_ID}")
             fi
 
-            sleep 10
-          done
+            RESPONSE="$(gh api "${api_arguments[@]}")"
+            MATCHES="$(jq -er '.check_runs | length' <<< "$RESPONSE")"
+            MATCHING_APPS="$(jq -er '[.check_runs[] | (.app.id // "unknown")] | unique | length' <<< "$RESPONSE")"
 
-          echo "::error::Promotion did not reach ${RELEASE_BRANCH}."
+            if (( MATCHING_APPS > 1 )) && [[ -z "$REQUIRED_CHECK_APP_ID" ]]; then
+              GATE_STATUS=ambiguous
+              GATE_CONCLUSION=ambiguous
+              GATE_REASON="Multiple apps reported '${REQUIRED_CHECK}'; configure required_check_app_id."
+            elif (( MATCHES > 0 )); then
+              CHECK="$(
+                jq -cer \
+                  '.check_runs | max_by([(.completed_at // .started_at // ""), .id])' \
+                  <<< "$RESPONSE"
+              )"
+              GATE_STATUS="$(jq -er '.status' <<< "$CHECK")"
+              GATE_CONCLUSION="$(jq -r '.conclusion // "pending"' <<< "$CHECK")"
+              GATE_DETAILS_URL="$(jq -r '.details_url // ""' <<< "$CHECK")"
+              GATE_APP_ID="$(jq -r '.app.id // ""' <<< "$CHECK")"
+
+              if [[ "$GATE_STATUS" == 'completed' && "$GATE_CONCLUSION" == 'success' ]]; then
+                GATE_GREEN=true
+                GATE_REASON='The required check run completed successfully.'
+              else
+                GATE_REASON="The required check run is ${GATE_STATUS}/${GATE_CONCLUSION}."
+              fi
+            fi
+          else
+            RESPONSE="$(
+              gh api \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/${REPOSITORY}/commits/${DEVELOPMENT_SHA}/status"
+            )"
+            STATUS_CONTEXT="$(
+              jq -c --arg context "$REQUIRED_CHECK" \
+                '[.statuses[] | select(.context == $context)] | sort_by(.created_at, .id) | reverse | .[0] // null' \
+                <<< "$RESPONSE"
+            )"
+
+            if [[ "$STATUS_CONTEXT" != 'null' ]]; then
+              GATE_STATUS="$(jq -er '.state' <<< "$STATUS_CONTEXT")"
+              GATE_CONCLUSION="$GATE_STATUS"
+              GATE_DETAILS_URL="$(jq -r '.target_url // ""' <<< "$STATUS_CONTEXT")"
+
+              if [[ "$GATE_STATUS" == 'success' ]]; then
+                GATE_GREEN=true
+                GATE_REASON='The required commit status succeeded.'
+              else
+                GATE_REASON="The required commit status is ${GATE_STATUS}."
+              fi
+            fi
+          fi
+
+          {
+            echo "gate_status=${GATE_STATUS}"
+            echo "gate_conclusion=${GATE_CONCLUSION}"
+            echo "gate_details_url=${GATE_DETAILS_URL}"
+            echo "gate_app_id=${GATE_APP_ID}"
+            echo "gate_green=${GATE_GREEN}"
+            echo "gate_reason=${GATE_REASON}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate release authentication
+        id: authentication
+        if: >-
+          steps.comparison.outputs.release_required == 'true' &&
+          steps.gate.outputs.gate_green == 'true'
+        shell: bash
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$RELEASE_TOKEN" ]]; then
+            if [[ -n "$RELEASE_APP_CLIENT_ID" || -n "$RELEASE_APP_PRIVATE_KEY" ]]; then
+              echo 'Configure either RELEASE_TOKEN or GitHub App credentials, not both.' >&2
+              exit 1
+            fi
+
+            echo 'mode=token' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -n "$RELEASE_APP_CLIENT_ID" && -n "$RELEASE_APP_PRIVATE_KEY" ]]; then
+            echo 'mode=app' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo 'Configure RELEASE_TOKEN or both RELEASE_APP_CLIENT_ID and RELEASE_APP_PRIVATE_KEY.' >&2
           exit 1
 
-      - name: Release Please
-        uses: googleapis/release-please-action@v5
+      - name: Create GitHub App token
+        id: app-token
+        if: ${{ steps.authentication.outputs.mode == 'app' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
-          token: ${{ secrets.release-token }}
-          release-type: ${{ inputs.release-type }}
-          target-branch: ${{ inputs.release-branch }}
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Revalidate development commit
+        id: revalidation
+        if: >-
+          steps.comparison.outputs.release_required == 'true' &&
+          steps.gate.outputs.gate_green == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          DEVELOPMENT_BRANCH: ${{ inputs.development_branch }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+          EXPECTED_DEVELOPMENT_SHA: ${{ steps.comparison.outputs.development_sha }}
+        run: |
+          set -euo pipefail
+
+          branch_sha() {
+            local encoded_branch
+            encoded_branch="$(jq -rn --arg value "$1" '$value | @uri')"
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/${REPOSITORY}/branches/${encoded_branch}" \
+              --jq '.commit.sha'
+          }
+
+          CURRENT_DEVELOPMENT_SHA="$(branch_sha "$DEVELOPMENT_BRANCH")"
+
+          if [[ "$CURRENT_DEVELOPMENT_SHA" != "$EXPECTED_DEVELOPMENT_SHA" ]]; then
+            echo 'The development branch moved after its release gate was checked; retry with the new commit.' >&2
+            exit 1
+          fi
+
+          CURRENT_RELEASE_SHA="$(branch_sha "$RELEASE_BRANCH")"
+          AHEAD="$(
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/${REPOSITORY}/compare/${CURRENT_RELEASE_SHA}...${EXPECTED_DEVELOPMENT_SHA}" \
+              --jq '.ahead_by'
+          )"
+          RELEASE_REQUIRED=false
+
+          if (( AHEAD > 0 )); then
+            RELEASE_REQUIRED=true
+          fi
+
+          {
+            echo "release_required=${RELEASE_REQUIRED}"
+            echo "current_release_sha=${CURRENT_RELEASE_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Find or create promotion pull request
+        id: promotion
+        if: ${{ steps.revalidation.outputs.release_required == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          DEVELOPMENT_BRANCH: ${{ inputs.development_branch }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+          PROMOTION_TITLE: ${{ inputs.promotion_title }}
+          EXPECTED_DEVELOPMENT_SHA: ${{ steps.comparison.outputs.development_sha }}
+          REQUIRED_CHECK: ${{ inputs.required_check }}
+        run: |
+          set -euo pipefail
+
+          list_pull_requests() {
+            gh pr list \
+              --repo "$REPOSITORY" \
+              --base "$RELEASE_BRANCH" \
+              --head "$DEVELOPMENT_BRANCH" \
+              --state open \
+              --json number,url,headRefOid,isDraft
+          }
+
+          PULL_REQUESTS="$(list_pull_requests)"
+          COUNT="$(jq -er 'length' <<< "$PULL_REQUESTS")"
+          ACTION=reused
+
+          if (( COUNT > 1 )); then
+            echo 'More than one open promotion pull request matches the configured branches.' >&2
+            exit 1
+          fi
+
+          if (( COUNT == 0 )); then
+            if gh pr create \
+              --repo "$REPOSITORY" \
+              --base "$RELEASE_BRANCH" \
+              --head "$DEVELOPMENT_BRANCH" \
+              --title "$PROMOTION_TITLE" \
+              --body "Automated promotion after '${REQUIRED_CHECK}' passed for ${EXPECTED_DEVELOPMENT_SHA}."; then
+              ACTION=created
+            else
+              echo 'Pull request creation failed; checking for a concurrently-created promotion PR.' >&2
+            fi
+
+            PULL_REQUESTS="$(list_pull_requests)"
+            COUNT="$(jq -er 'length' <<< "$PULL_REQUESTS")"
+
+            if (( COUNT != 1 )); then
+              echo 'Unable to resolve a single promotion pull request after creation.' >&2
+              exit 1
+            fi
+          fi
+
+          PULL_REQUEST="$(jq -cer '.[0]' <<< "$PULL_REQUESTS")"
+          NUMBER="$(jq -er '.number' <<< "$PULL_REQUEST")"
+          URL="$(jq -er '.url' <<< "$PULL_REQUEST")"
+          HEAD_SHA="$(jq -er '.headRefOid' <<< "$PULL_REQUEST")"
+          IS_DRAFT="$(jq -r '.isDraft' <<< "$PULL_REQUEST")"
+
+          if [[ "$HEAD_SHA" != "$EXPECTED_DEVELOPMENT_SHA" ]]; then
+            echo 'The promotion pull request head moved after its release gate was checked.' >&2
+            exit 1
+          fi
+
+          if [[ "$IS_DRAFT" == 'true' ]]; then
+            echo 'The matching promotion pull request is a draft and will not be merged automatically.' >&2
+            exit 1
+          fi
+
+          {
+            echo "promotion_pr_action=${ACTION}"
+            echo "promotion_pr_number=${NUMBER}"
+            echo "promotion_pr_url=${URL}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Configure promotion auto-merge
+        id: auto-merge
+        if: ${{ steps.promotion.outputs.promotion_pr_number != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.promotion.outputs.promotion_pr_number }}
+          EXPECTED_DEVELOPMENT_SHA: ${{ steps.comparison.outputs.development_sha }}
+          AUTO_MERGE: ${{ inputs.auto_merge }}
+          MERGE_METHOD: ${{ inputs.merge_method }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$AUTO_MERGE" != 'true' ]]; then
+            echo 'auto_merge_state=disabled' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PULL_REQUEST="$(
+            gh pr view "$PR_NUMBER" \
+              --repo "$REPOSITORY" \
+              --json autoMergeRequest,headRefOid,mergeStateStatus
+          )"
+          HEAD_SHA="$(jq -er '.headRefOid' <<< "$PULL_REQUEST")"
+
+          if [[ "$HEAD_SHA" != "$EXPECTED_DEVELOPMENT_SHA" ]]; then
+            echo 'The promotion pull request moved before auto-merge was configured.' >&2
+            exit 1
+          fi
+
+          if [[ "$(jq -r '.autoMergeRequest != null' <<< "$PULL_REQUEST")" == 'true' ]]; then
+            echo 'auto_merge_state=already-enabled' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          merge_arguments=()
+          case "$MERGE_METHOD" in
+            merge) merge_arguments+=(--merge) ;;
+            rebase) merge_arguments+=(--rebase) ;;
+            queue) ;;
+          esac
+
+          gh pr merge "$PR_NUMBER" \
+            --repo "$REPOSITORY" \
+            --auto \
+            --match-head-commit "$EXPECTED_DEVELOPMENT_SHA" \
+            "${merge_arguments[@]}"
+
+          echo 'auto_merge_state=requested' >> "$GITHUB_OUTPUT"
+
+      - name: Write release summary
+        id: summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          DEVELOPMENT_BRANCH: ${{ inputs.development_branch }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+          DEVELOPMENT_SHA: ${{ steps.comparison.outputs.development_sha }}
+          RELEASE_SHA: ${{ steps.comparison.outputs.release_sha }}
+          AHEAD: ${{ steps.comparison.outputs.ahead }}
+          BEHIND: ${{ steps.comparison.outputs.behind }}
+          COMPARISON_STATUS: ${{ steps.comparison.outputs.comparison_status }}
+          RELEASE_REQUIRED: ${{ steps.comparison.outputs.release_required }}
+          REQUIRED_CHECK: ${{ inputs.required_check }}
+          REQUIRED_CHECK_KIND: ${{ inputs.required_check_kind }}
+          GATE_STATUS: ${{ steps.gate.outputs.gate_status }}
+          GATE_CONCLUSION: ${{ steps.gate.outputs.gate_conclusion }}
+          GATE_REASON: ${{ steps.gate.outputs.gate_reason }}
+          GATE_DETAILS_URL: ${{ steps.gate.outputs.gate_details_url }}
+          PROMOTION_PR_ACTION: ${{ steps.promotion.outputs.promotion_pr_action }}
+          PROMOTION_PR_URL: ${{ steps.promotion.outputs.promotion_pr_url }}
+          AUTO_MERGE_STATE: ${{ steps.auto-merge.outputs.auto_merge_state }}
+          REVALIDATED_RELEASE_REQUIRED: ${{ steps.revalidation.outputs.release_required }}
+        run: |
+          set -euo pipefail
+
+          OUTCOME=failed
+          if [[ "$RELEASE_REQUIRED" != 'true' && -n "$COMPARISON_STATUS" ]]; then
+            OUTCOME=no_changes
+          elif [[ "$RELEASE_REQUIRED" == 'true' && "$GATE_CONCLUSION" != 'success' ]]; then
+            OUTCOME=blocked
+          elif [[ "$REVALIDATED_RELEASE_REQUIRED" == 'false' ]]; then
+            OUTCOME=no_changes
+          elif [[ -n "$PROMOTION_PR_URL" ]]; then
+            OUTCOME="promotion_pr_${PROMOTION_PR_ACTION}"
+          fi
+
+          echo "outcome=${OUTCOME}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo '## Release promotion'
+            echo ''
+            echo '| Item | Result |'
+            echo '|---|---|'
+            echo "| Development branch | \`${DEVELOPMENT_BRANCH}\` |"
+            echo "| Development SHA | \`${DEVELOPMENT_SHA:-unavailable}\` |"
+            echo "| Release branch | \`${RELEASE_BRANCH}\` |"
+            echo "| Release SHA | \`${RELEASE_SHA:-unavailable}\` |"
+            echo "| Comparison | \`${COMPARISON_STATUS:-unavailable}\` |"
+            echo "| Ahead / behind | ${AHEAD:-unavailable} / ${BEHIND:-unavailable} |"
+            echo "| Gate | \`${REQUIRED_CHECK}\` (${REQUIRED_CHECK_KIND}) |"
+            echo "| Gate result | \`${GATE_STATUS:-not-evaluated}/${GATE_CONCLUSION:-not-evaluated}\` |"
+            echo "| Outcome | \`${OUTCOME}\` |"
+
+            if [[ -n "$GATE_REASON" ]]; then
+              echo ''
+              echo "$GATE_REASON"
+            fi
+
+            if [[ -n "$GATE_DETAILS_URL" ]]; then
+              echo ''
+              echo "Gate details: ${GATE_DETAILS_URL}"
+            fi
+
+            if [[ -n "$PROMOTION_PR_URL" ]]; then
+              echo ''
+              echo "Promotion pull request: ${PROMOTION_PR_URL}"
+              echo "Auto-merge: ${AUTO_MERGE_STATE:-not-requested}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail when release gate is not green
+        if: >-
+          always() &&
+          steps.comparison.outputs.release_required == 'true' &&
+          steps.gate.outputs.gate_green != 'true'
+        shell: bash
+        env:
+          GATE_REASON: ${{ steps.gate.outputs.gate_reason }}
+        run: |
+          echo "${GATE_REASON:-The required release gate did not succeed.}" >&2
+          exit 1
