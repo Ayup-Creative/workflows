@@ -142,12 +142,20 @@ derive the correct version.
 | `release_type` | `php` | Release Please strategy; override for Node, Python, Ruby, or another supported type. |
 | `auto_merge` | `true` | Enable protected auto-merge for Release Please pull requests. |
 | `merge_method` | `merge` | Use `merge`, `rebase`, `squash`, or `queue` for the release PR. |
+| `cleanup_release_branches` | `true` | Delete merged Release Please branches after release processing. |
 
 Release Please derives patch, minor, and major versions from Conventional
 Commits, maintains `CHANGELOG.md`, and creates release notes, tags, and GitHub
 Releases. A `fix:` commit produces a patch, `feat:` produces a minor, and a
 breaking-change marker produces a major under the default strategy. Commits
 that do not request a release result in a successful no-change run.
+
+After release processing, the workflow removes same-repository
+`release-please--branches--*` branches only when no matching release pull
+request remains open and a merged pull request targets the configured release
+branch at the branch's current SHA. Open, unmerged, and concurrently moved
+branches are retained. Set `cleanup_release_branches: false` to preserve merged
+Release Please branches.
 
 ### Consumer repository requirements
 

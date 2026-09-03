@@ -629,6 +629,171 @@ class PromotionWorkflowsTest < Minitest::Test
 end
 
 class ReleaseWorkflowTest < Minitest::Test
+  def test_release_workflow_exposes_safe_branch_cleanup_by_default
+    inputs = workflow_call_inputs(release_workflow)
+    cleanup = first_job(release_workflow).fetch('steps').find do |step|
+      step['name'] == 'Clean up merged Release Please branches'
+    end
+
+    assert_equal true, inputs.dig('cleanup_release_branches', 'default')
+    assert_equal 'boolean', inputs.dig('cleanup_release_branches', 'type')
+    refute_nil cleanup
+    assert_equal '${{ inputs.cleanup_release_branches }}', cleanup.dig('env', 'CLEANUP_RELEASE_BRANCHES')
+  end
+
+  def test_release_branch_cleanup_is_guarded_and_reported
+    steps = first_job(release_workflow).fetch('steps')
+    cleanup = steps.find { |step| step['name'] == 'Clean up merged Release Please branches' }
+    summary = steps.find { |step| step['name'] == 'Write release summary' }
+    script = cleanup.fetch('run')
+
+    assert_operator steps.index(cleanup), :>, steps.index { |step| step['name'] == 'Run Release Please' }
+    assert_includes script, 'release-please--branches--'
+    assert_includes script, 'state=open'
+    assert_includes script, 'state=closed'
+    assert_includes script, '.merged_at != null'
+    assert_includes script, '.head.sha == $sha'
+    assert_includes script, '--method DELETE'
+    assert_includes script, 'git/refs/heads/'
+    assert_includes summary.fetch('env').values, '${{ steps.cleanup.outputs.cleanup_state }}'
+    assert_includes summary.fetch('env').values, '${{ steps.cleanup.outputs.deleted_branches }}'
+    assert_includes summary.fetch('env').values, '${{ steps.cleanup.outputs.retained_branches }}'
+  end
+
+  def test_release_branch_cleanup_can_be_disabled_without_calling_github
+    cleanup = first_job(release_workflow).fetch('steps').find do |step|
+      step['name'] == 'Clean up merged Release Please branches'
+    end
+
+    Dir.mktmpdir('release-cleanup-disabled') do |directory|
+      calls = File.join(directory, 'calls')
+      gh = "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$MOCK_GH_CALLS\"\nexit 99\n"
+      result = run_shell_script_with_gh(
+        cleanup.fetch('run'),
+        gh,
+        'MOCK_GH_CALLS' => calls,
+        'CLEANUP_RELEASE_BRANCHES' => 'false',
+        'REPOSITORY' => 'example/project',
+        'REPOSITORY_OWNER' => 'example',
+        'RELEASE_BRANCH' => 'main'
+      )
+
+      assert_predicate result, :success?, result.stderr
+      assert_equal 'disabled', result.outputs.fetch('cleanup_state')
+      assert_equal [], JSON.parse(result.outputs.fetch('deleted_branches'))
+      assert_equal [], JSON.parse(result.outputs.fetch('retained_branches'))
+      refute File.exist?(calls)
+    end
+  end
+
+  def test_release_branch_cleanup_deletes_only_a_merged_branch_at_its_current_sha
+    cleanup = first_job(release_workflow).fetch('steps').find do |step|
+      step['name'] == 'Clean up merged Release Please branches'
+    end
+    refs = [
+      { 'ref' => 'refs/heads/release-please--branches--main', 'object' => { 'sha' => 'merged-sha' } },
+      { 'ref' => 'refs/heads/release-please--branches--main--open', 'object' => { 'sha' => 'open-sha' } },
+      { 'ref' => 'refs/heads/release-please--branches--main--closed', 'object' => { 'sha' => 'closed-sha' } }
+    ]
+    merged_pull_request = [
+      {
+        'merged_at' => '2026-09-03T12:00:00Z',
+        'head' => { 'sha' => 'merged-sha', 'repo' => { 'full_name' => 'example/project' } },
+        'base' => { 'ref' => 'main' }
+      }
+    ]
+
+    Dir.mktmpdir('release-cleanup') do |directory|
+      calls = File.join(directory, 'calls')
+      gh = <<~'BASH'
+        #!/usr/bin/env bash
+        printf '%s\n' "$*" >> "$MOCK_GH_CALLS"
+        case "$*" in
+          *matching-refs*) printf '%s\n' "$MOCK_REFS" ;;
+          *state=open*main--open*) printf '%s\n' '[{"number":12}]' ;;
+          *state=open*) printf '%s\n' '[]' ;;
+          *state=closed*main--closed*) printf '%s\n' '[]' ;;
+          *state=closed*) printf '%s\n' "$MOCK_MERGED_PULL_REQUESTS" ;;
+          *git/ref/heads/release-please--branches--main*) printf '%s\n' 'merged-sha' ;;
+          *--method\ DELETE*git/refs/heads/release-please--branches--main) exit 0 ;;
+          *) exit 99 ;;
+        esac
+      BASH
+      result = run_shell_script_with_gh(
+        cleanup.fetch('run'),
+        gh,
+        'MOCK_GH_CALLS' => calls,
+        'MOCK_REFS' => JSON.generate(refs),
+        'MOCK_MERGED_PULL_REQUESTS' => JSON.generate(merged_pull_request),
+        'CLEANUP_RELEASE_BRANCHES' => 'true',
+        'REPOSITORY' => 'example/project',
+        'REPOSITORY_OWNER' => 'example',
+        'RELEASE_BRANCH' => 'main'
+      )
+      invocations = File.readlines(calls, chomp: true)
+
+      assert_predicate result, :success?, result.stderr
+      assert_equal 'completed', result.outputs.fetch('cleanup_state')
+      assert_equal ['release-please--branches--main'], JSON.parse(result.outputs.fetch('deleted_branches'))
+      assert_equal [
+        'release-please--branches--main--open (open pull request)',
+        'release-please--branches--main--closed (no merged pull request at current SHA)'
+      ], JSON.parse(result.outputs.fetch('retained_branches'))
+      assert_equal 1, invocations.count { |call| call.include?('--method DELETE') }
+    end
+  end
+
+  def test_release_branch_cleanup_retains_a_branch_that_moves_before_deletion
+    cleanup = first_job(release_workflow).fetch('steps').find do |step|
+      step['name'] == 'Clean up merged Release Please branches'
+    end
+    refs = [
+      { 'ref' => 'refs/heads/release-please--branches--main', 'object' => { 'sha' => 'merged-sha' } }
+    ]
+    merged_pull_request = [
+      {
+        'merged_at' => '2026-09-03T12:00:00Z',
+        'head' => { 'sha' => 'merged-sha', 'repo' => { 'full_name' => 'example/project' } },
+        'base' => { 'ref' => 'main' }
+      }
+    ]
+
+    Dir.mktmpdir('release-cleanup-moved') do |directory|
+      calls = File.join(directory, 'calls')
+      gh = <<~'BASH'
+        #!/usr/bin/env bash
+        printf '%s\n' "$*" >> "$MOCK_GH_CALLS"
+        case "$*" in
+          *matching-refs*) printf '%s\n' "$MOCK_REFS" ;;
+          *state=open*) printf '%s\n' '[]' ;;
+          *state=closed*) printf '%s\n' "$MOCK_MERGED_PULL_REQUESTS" ;;
+          *git/ref/heads/release-please--branches--main*) printf '%s\n' 'new-sha' ;;
+          *--method\ DELETE*) exit 98 ;;
+          *) exit 99 ;;
+        esac
+      BASH
+      result = run_shell_script_with_gh(
+        cleanup.fetch('run'),
+        gh,
+        'MOCK_GH_CALLS' => calls,
+        'MOCK_REFS' => JSON.generate(refs),
+        'MOCK_MERGED_PULL_REQUESTS' => JSON.generate(merged_pull_request),
+        'CLEANUP_RELEASE_BRANCHES' => 'true',
+        'REPOSITORY' => 'example/project',
+        'REPOSITORY_OWNER' => 'example',
+        'RELEASE_BRANCH' => 'main'
+      )
+      invocations = File.readlines(calls, chomp: true)
+
+      assert_predicate result, :success?, result.stderr
+      assert_equal [], JSON.parse(result.outputs.fetch('deleted_branches'))
+      assert_equal [
+        'release-please--branches--main (branch moved during cleanup)'
+      ], JSON.parse(result.outputs.fetch('retained_branches'))
+      refute invocations.any? { |call| call.include?('--method DELETE') }
+    end
+  end
+
   def test_release_auto_merge_handles_non_draft_release_please_pull_requests
     script = first_job(release_workflow).fetch('steps').find do |step|
       step['name'] == 'Configure release auto-merge'
@@ -675,6 +840,7 @@ class ReleaseWorkflowTest < Minitest::Test
     assert_equal 'php', inputs.dig('release_type', 'default')
     assert_equal true, inputs.dig('auto_merge', 'default')
     assert_equal 'merge', inputs.dig('merge_method', 'default')
+    assert_equal true, inputs.dig('cleanup_release_branches', 'default')
     assert_equal false, secrets.dig('RELEASE_TOKEN', 'required')
     assert_equal false, secrets.dig('RELEASE_APP_CLIENT_ID', 'required')
     assert_equal false, secrets.dig('RELEASE_APP_PRIVATE_KEY', 'required')

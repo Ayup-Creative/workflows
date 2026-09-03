@@ -23,6 +23,11 @@ name: Reusable Release Please
         required: false
         default: merge
         type: string
+      cleanup_release_branches:
+        description: Delete merged Release Please branches after release processing.
+        required: false
+        default: true
+        type: boolean
     secrets:
       RELEASE_TOKEN:
         description: Fine-grained PAT used for release mutations.
@@ -220,6 +225,142 @@ jobs:
 
           echo "auto_merge_state=requested:${requested},already-enabled:${already_enabled}" >> "$GITHUB_OUTPUT"
 
+      - name: Clean up merged Release Please branches
+        id: cleanup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+          CLEANUP_RELEASE_BRANCHES: ${{ inputs.cleanup_release_branches }}
+        run: |
+          set -euo pipefail
+
+          deleted_branches=()
+          retained_branches=()
+
+          json_array() {
+            if (( $# == 0 )); then
+              printf '[]'
+              return
+            fi
+
+            printf '%s\n' "$@" | jq -Rsc 'split("\n")[:-1]'
+          }
+
+          write_outputs() {
+            local state="$1"
+            local deleted_json
+            local retained_json
+
+            deleted_json="$(json_array "${deleted_branches[@]}")"
+            retained_json="$(json_array "${retained_branches[@]}")"
+
+            {
+              echo "cleanup_state=${state}"
+              echo "deleted_branches=${deleted_json}"
+              echo "retained_branches=${retained_json}"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          if [[ "$CLEANUP_RELEASE_BRANCHES" != 'true' ]]; then
+            write_outputs disabled
+            exit 0
+          fi
+
+          MATCHING_REFS="$(
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/${REPOSITORY}/git/matching-refs/heads/release-please--branches--"
+          )"
+
+          if ! jq -e 'type == "array"' <<< "$MATCHING_REFS" >/dev/null; then
+            echo 'GitHub returned invalid Release Please branch metadata.' >&2
+            exit 1
+          fi
+
+          while IFS=$'\t' read -r full_ref ref_sha; do
+            [[ -n "$full_ref" ]] || continue
+
+            if [[ "$full_ref" != refs/heads/release-please--branches--* ]]; then
+              echo "Unexpected ref returned for Release Please cleanup: ${full_ref}." >&2
+              exit 1
+            fi
+
+            branch="${full_ref#refs/heads/}"
+            open_pull_requests="$(
+              gh api \
+                --method GET \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/${REPOSITORY}/pulls" \
+                -f state=open \
+                -f base="$RELEASE_BRANCH" \
+                -f head="${REPOSITORY_OWNER}:${branch}" \
+                -f per_page=100
+            )"
+
+            if jq -e 'length > 0' <<< "$open_pull_requests" >/dev/null; then
+              retained_branches+=("${branch} (open pull request)")
+              continue
+            fi
+
+            closed_pull_requests="$(
+              gh api \
+                --method GET \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/${REPOSITORY}/pulls" \
+                -f state=closed \
+                -f base="$RELEASE_BRANCH" \
+                -f head="${REPOSITORY_OWNER}:${branch}" \
+                -f sort=updated \
+                -f direction=desc \
+                -f per_page=100
+            )"
+
+            if ! jq -e \
+              --arg sha "$ref_sha" \
+              --arg repository "$REPOSITORY" \
+              --arg base "$RELEASE_BRANCH" \
+              'any(.[]; .merged_at != null and .head.sha == $sha and (.head.repo.full_name // "") == $repository and .base.ref == $base)' \
+              <<< "$closed_pull_requests" >/dev/null; then
+              retained_branches+=("${branch} (no merged pull request at current SHA)")
+              continue
+            fi
+
+            encoded_branch="$(jq -rn --arg value "$branch" '$value | @uri')"
+            current_sha="$(
+              gh api \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/${REPOSITORY}/git/ref/heads/${encoded_branch}" \
+                --jq '.object.sha'
+            )"
+
+            if [[ "$current_sha" != "$ref_sha" ]]; then
+              retained_branches+=("${branch} (branch moved during cleanup)")
+              continue
+            fi
+
+            gh api \
+              --method DELETE \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/${REPOSITORY}/git/refs/heads/${encoded_branch}" \
+              >/dev/null
+
+            deleted_branches+=("$branch")
+          done < <(jq -r '.[] | [.ref, .object.sha] | @tsv' <<< "$MATCHING_REFS")
+
+          if (( ${#deleted_branches[@]} == 0 && ${#retained_branches[@]} == 0 )); then
+            write_outputs no-matching-branches
+          else
+            write_outputs completed
+          fi
+
       - name: Write release summary
         if: ${{ always() }}
         shell: bash
@@ -233,6 +374,9 @@ jobs:
           TAG_NAME: ${{ steps.release.outputs.tag_name }}
           RELEASE_URL: ${{ steps.release.outputs.html_url }}
           AUTO_MERGE_STATE: ${{ steps.auto-merge.outputs.auto_merge_state }}
+          CLEANUP_STATE: ${{ steps.cleanup.outputs.cleanup_state }}
+          DELETED_RELEASE_BRANCHES: ${{ steps.cleanup.outputs.deleted_branches }}
+          RETAINED_RELEASE_BRANCHES: ${{ steps.cleanup.outputs.retained_branches }}
         run: |
           set -euo pipefail
 
@@ -253,6 +397,9 @@ jobs:
             echo "| Outcome | \`${OUTCOME}\` |"
             echo "| Release PR created or updated | \`${PULL_REQUESTS_CREATED:-false}\` |"
             echo "| Auto-merge | \`${AUTO_MERGE_STATE:-not-requested}\` |"
+            echo "| Release branch cleanup | \`${CLEANUP_STATE:-not-completed}\` |"
+            echo "| Deleted release branches | \`${DELETED_RELEASE_BRANCHES:-[]}\` |"
+            echo "| Retained release branches | \`${RETAINED_RELEASE_BRANCHES:-[]}\` |"
             echo "| GitHub Release created | \`${RELEASES_CREATED:-false}\` |"
             echo "| Released paths | \`${PATHS_RELEASED:-[]}\` |"
 
